@@ -157,13 +157,25 @@ Your MCP client should connect to the oscilloscope and capture the waveform data
 Use the `capture_waveform_wfm` tool when you want the oscilloscope's compact native
 acquisition without transferring enormous per-channel JSON arrays. One call stops the
 acquisition, saves every enabled analog channel in `data.wfm`, and writes a compact
-`metadata.json` sidecar with conversion parameters, channel order, file size, and SHA-256.
+`metadata.json` sidecar with conversion parameters, complete channel/timebase/acquisition/
+trigger setup, channel order, file size, and SHA-256. Set `include_screenshot` to store a
+digest-verified `screenshot.png` in the same atomic capture directory.
 
 Before publishing the capture directory, the server checks the native payload geometry and
 requires an exact raw-sample match for every enabled channel. The optional
 `verification_points` argument defaults to 1,024 points per channel. The result returns the
 capture directory, both file paths, enabled-channel order, point count, byte count, digest,
 and verification status.
+
+For repeatable setup, `get_capture_session_config` reads the complete normalized capture
+configuration. `configure_capture_session` stops acquisition, applies an explicit four-channel
+setup plus timebase, acquisition, and edge-trigger settings in dependency-safe order, then
+returns the normalized request, complete readback, and any differences.
+
+For externally stimulated transient tests, `arm_single_and_capture_wfm` arms one acquisition,
+waits for the configured trigger, and automatically creates the same verified native bundle
+after acquisition stops. It never forces a trigger. A timeout stops acquisition and fails
+without publishing a capture directory.
 
 ### Accessing Temp Files in Docker
 

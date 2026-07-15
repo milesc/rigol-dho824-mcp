@@ -5,6 +5,7 @@ import functools
 import hashlib
 import inspect
 import io
+import math
 import mmap
 import os
 import random
@@ -20,7 +21,7 @@ from ftplib import FTP
 from typing import Optional, TypedDict, Annotated, List, Literal, cast, Union, Sequence
 from typing_extensions import NotRequired
 import numpy as np
-from pydantic import Field
+from pydantic import BaseModel, Field
 from fastmcp import FastMCP, Context
 from fastmcp.server.dependencies import get_context
 from fastmcp.utilities.logging import get_logger
@@ -222,6 +223,22 @@ WidthConditionField = Annotated[str, Field(description="Width condition (GREATER
 AveragesCountField = Annotated[int, Field(description="Number of averages (2-65536)", ge=2, le=65536)]
 UltraTimeoutField = Annotated[float, Field(description="Timeout duration in seconds")]
 MaxFramesField = Annotated[int, Field(description="Maximum frames to capture (1-100; MOSaic mode limited to 80)", ge=1, le=100)]
+VerificationPointsField = Annotated[
+    int,
+    Field(
+        ge=1,
+        le=10000,
+        description="Raw points to verify per enabled channel",
+    ),
+]
+CaptureWaitTimeoutField = Annotated[
+    float,
+    Field(
+        ge=0.1,
+        le=3600.0,
+        description="Maximum time to wait for the single acquisition to complete",
+    ),
+]
 
 # Recording-related fields
 FrameCountField = Annotated[int, Field(description="Number of frames to record", ge=1)]
@@ -309,8 +326,8 @@ class TriggerSweep(str, Enum):
     """Trigger sweep modes."""
 
     AUTO = "AUTO"  # Auto trigger
-    NORMAL = "NORMal"  # Normal trigger
-    SINGLE = "SINGle"  # Single trigger
+    NORMAL = "NORMAL"  # Normal trigger
+    SINGLE = "SINGLE"  # Single trigger
 
 
 class WaveformMode(str, Enum):
@@ -660,6 +677,71 @@ class BitOrder(str, Enum):
 TimebaseModeField = Annotated[TimebaseMode, Field(description="Timebase mode")]
 
 
+# === COMPLETE CAPTURE SESSION INPUTS ===
+
+
+class CaptureChannelSetup(BaseModel):
+    """Complete deterministic setup for one analog channel."""
+
+    channel: ChannelNumber
+    enabled: EnabledField
+    coupling: Annotated[ChannelCoupling, Field(description="Coupling mode")]
+    probe_ratio: ProbeRatioField
+    bandwidth_limit: BandwidthLimitField
+    vertical_scale: VerticalScaleField
+    vertical_offset: VerticalOffsetField
+    inverted: InvertedField = False
+    units: Annotated[ChannelUnits, Field(description="Display units")] = ChannelUnits.VOLT
+    label: ChannelLabelField = ""
+    label_visible: LabelVisibleField = True
+
+
+class CaptureTimebaseSetup(BaseModel):
+    """Complete deterministic main and optional delayed timebase setup."""
+
+    mode: TimebaseModeField = TimebaseMode.MAIN
+    time_per_div: MainTimeScaleField
+    time_offset: TimeOffsetField
+    delayed_enabled: Annotated[
+        bool, Field(description="Whether delayed/zoom timebase is enabled")
+    ] = False
+    delayed_time_per_div: Optional[DelayedTimeScaleField] = None
+    delayed_time_offset: Optional[DelayedTimeOffsetField] = None
+
+
+class CaptureAcquisitionSetup(BaseModel):
+    """Complete acquisition engine setup for a capture session."""
+
+    memory_depth: Annotated[MemoryDepth, Field(description="Memory depth setting")]
+    acquisition_type: Annotated[
+        AcquisitionType, Field(description="Acquisition type")
+    ] = AcquisitionType.NORMAL
+    averages: Optional[AveragesCountField] = None
+
+
+class CaptureEdgeTriggerSetup(BaseModel):
+    """Complete edge-trigger setup for a capture session."""
+
+    channel: ChannelNumber
+    trigger_level: TriggerLevelField
+    trigger_slope: Annotated[
+        TriggerSlope, Field(description="Edge slope: POSITIVE, NEGATIVE, or EITHER")
+    ]
+    trigger_coupling: Annotated[
+        TriggerCouplingType,
+        Field(description="Trigger coupling mode: AC, DC, LFReject, or HFReject"),
+    ] = "DC"
+    trigger_sweep: Annotated[
+        TriggerSweep, Field(description="Trigger sweep mode")
+    ] = TriggerSweep.NORMAL
+    holdoff_time: Annotated[
+        float, Field(ge=8e-9, le=10.0, description="Trigger holdoff time in seconds")
+    ] = 8e-9
+    noise_reject_enabled: Annotated[
+        bool, Field(description="Whether trigger noise rejection is enabled")
+    ] = False
+
+
 # === PROTOCOL-SPECIFIC TYPE ALIASES ===
 
 # Baud rate field
@@ -885,6 +967,82 @@ class TriggerNoiseRejectResult(TypedDict):
     ]
 
 
+class CaptureAcquisitionConfigResult(TypedDict):
+    """Complete acquisition engine readback."""
+
+    memory_depth: Annotated[int, Field(description="Memory depth in points")]
+    sample_rate: Annotated[float, Field(description="Sample rate in Sa/s")]
+    acquisition_type: Annotated[
+        AcquisitionType, Field(description="Acquisition type mode")
+    ]
+    averages: AveragesCountField
+
+
+class CaptureTriggerConfigResult(TypedDict):
+    """Complete trigger readback for capture provenance."""
+
+    trigger_status: Annotated[TriggerStatus, Field(description="Trigger status")]
+    trigger_mode: Annotated[TriggerMode, Field(description="Trigger mode")]
+    source: Annotated[
+        Optional[str], Field(description="Trigger source identifier")
+    ]
+    channel: Annotated[
+        Optional[ChannelNumber], Field(description="Analog trigger source channel")
+    ]
+    trigger_level: Annotated[
+        Optional[float], Field(description="Trigger level in volts")
+    ]
+    trigger_slope: Annotated[
+        Optional[TriggerSlope], Field(description="Trigger edge slope")
+    ]
+    trigger_coupling: Annotated[
+        TriggerCouplingType, Field(description="Trigger coupling mode")
+    ]
+    trigger_sweep: Annotated[
+        TriggerSweep, Field(description="Trigger sweep mode")
+    ]
+    holdoff_time: Annotated[
+        float, Field(description="Trigger holdoff time in seconds")
+    ]
+    noise_reject_enabled: Annotated[
+        bool, Field(description="Whether trigger noise rejection is enabled")
+    ]
+
+
+class CaptureSessionSnapshot(TypedDict):
+    """Complete readback of settings that define a waveform acquisition."""
+
+    identity: Annotated[str, Field(description="Oscilloscope identity")]
+    channels: Annotated[
+        List[ChannelConfigResult], Field(description="All analog channel settings")
+    ]
+    timebase: Annotated[
+        TimebaseConfigResult, Field(description="Complete timebase settings")
+    ]
+    acquisition: Annotated[
+        CaptureAcquisitionConfigResult,
+        Field(description="Complete acquisition engine settings"),
+    ]
+    trigger: Annotated[
+        CaptureTriggerConfigResult, Field(description="Complete trigger settings")
+    ]
+
+
+class CaptureSessionConfigResult(TypedDict):
+    """Requested capture setup and verified instrument readback."""
+
+    requested: Annotated[dict, Field(description="Normalized requested setup")]
+    actual: Annotated[
+        CaptureSessionSnapshot, Field(description="Complete instrument readback")
+    ]
+    differences: Annotated[
+        List[str], Field(description="Requested settings that differ from readback")
+    ]
+    verified: Annotated[
+        bool, Field(description="Whether every requested setting matched readback")
+    ]
+
+
 # Action results
 class ActionResult(TypedDict):
     """Result for simple action operations."""
@@ -1006,6 +1164,10 @@ class NativeWfmCaptureResult(TypedDict):
     metadata_file_path: Annotated[
         str, Field(description="File path to the compact JSON metadata sidecar")
     ]
+    screenshot_file_path: Annotated[
+        Optional[str],
+        Field(description="File path to the optional oscilloscope screenshot"),
+    ]
     wfm_bytes: Annotated[int, Field(description="Size of the WFM file in bytes")]
     wfm_sha256: Annotated[
         str, Field(description="SHA-256 digest of the completed WFM file")
@@ -1022,6 +1184,14 @@ class NativeWfmCaptureResult(TypedDict):
     ]
     verified: Annotated[
         bool, Field(description="Whether all channel verification samples matched exactly")
+    ]
+
+
+class ArmedNativeWfmCaptureResult(NativeWfmCaptureResult):
+    """Result for a single acquisition that was armed, completed, and exported."""
+
+    wait_seconds: Annotated[
+        float, Field(description="Time spent waiting for the acquisition to complete")
     ]
 
 
@@ -1959,7 +2129,9 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
             return None
 
     async def _capture_screenshot_internal(
-        filename_prefix: str, tool_metadata: Optional[dict] = None
+        filename_prefix: str,
+        tool_metadata: Optional[dict] = None,
+        output_path: Optional[str] = None,
     ) -> Optional[str]:
         """
         Internal helper to capture a screenshot with metadata embedding.
@@ -1968,6 +2140,8 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
             filename_prefix: Prefix for the screenshot filename (without extension)
             tool_metadata: Optional dictionary containing tool call metadata to embed in Tier 3.
                           If None, only Tier 1 (EXIF) and Tier 2 (PNG text) are embedded.
+            output_path: Optional exact internal destination path. When omitted, a unique
+                         file is created in the configured temporary directory.
 
         Returns:
             File path of saved screenshot (client-translated if applicable), or None if capture failed
@@ -1995,12 +2169,16 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
                 ),
             )
 
-            # Create temporary file
-            fd, file_path = tempfile.mkstemp(
-                suffix=".png",
-                prefix=f"{filename_prefix}_",
-                dir=temp_dir,
-            )
+            # Create the destination file without overwriting an existing artifact.
+            if output_path is None:
+                fd, file_path = tempfile.mkstemp(
+                    suffix=".png",
+                    prefix=f"{filename_prefix}_",
+                    dir=temp_dir,
+                )
+            else:
+                file_path = output_path
+                fd = os.open(file_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 
             # Load PNG from in-memory bytes and add metadata
             img = Image.open(io.BytesIO(png_data))
@@ -2220,13 +2398,35 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
 
     def map_acquisition_type(raw_type: str) -> AcquisitionType:
         """Map raw acquisition type to enum."""
-        type_map = {
-            "NORM": AcquisitionType.NORMAL,
-            "AVER": AcquisitionType.AVERAGE,
-            "PEAK": AcquisitionType.PEAK,
-            "ULTR": AcquisitionType.ULTRA,
+        normalized = raw_type.strip().upper()
+        if normalized.startswith("AVER"):
+            return AcquisitionType.AVERAGE
+        if normalized.startswith("PEAK"):
+            return AcquisitionType.PEAK
+        if normalized.startswith("ULTR"):
+            return AcquisitionType.ULTRA
+        return AcquisitionType.NORMAL
+
+    def map_trigger_coupling_response(raw_coupling: str) -> TriggerCouplingType:
+        """Map trigger coupling readback to its user-facing value."""
+        coupling_map: dict[str, TriggerCouplingType] = {
+            "AC": "AC",
+            "DC": "DC",
+            "LFREJ": "LFReject",
+            "LFR": "LFReject",
+            "HFREJ": "HFReject",
+            "HFR": "HFReject",
         }
-        return type_map.get(raw_type, AcquisitionType.NORMAL)
+        return coupling_map.get(raw_coupling.strip().upper(), "DC")
+
+    def map_trigger_sweep_response(raw_sweep: str) -> TriggerSweep:
+        """Map trigger sweep readback to its user-facing value."""
+        normalized = raw_sweep.strip().upper()
+        if normalized.startswith("NORM"):
+            return TriggerSweep.NORMAL
+        if normalized.startswith("SING"):
+            return TriggerSweep.SINGLE
+        return TriggerSweep.AUTO
 
     def map_trigger_mode(raw_mode: str) -> TriggerMode:
         """Map SCPI trigger mode response to TriggerMode enum."""
@@ -2532,27 +2732,15 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
             wfm_error=wfm_error_msg,
         )
 
-    @mcp.tool
-    @with_scope_connection
-    async def capture_waveform_wfm(
+    async def _capture_native_wfm_bundle(
         ctx: Context,
-        verification_points: Annotated[
-            int,
-            Field(
-                ge=1,
-                le=10000,
-                description="Raw points to verify per enabled channel",
-            ),
-        ] = DEFAULT_WFM_VERIFY_POINTS,
+        verification_points: int,
+        include_screenshot: bool,
+        *,
+        stop_before_capture: bool,
+        progress_start: float = 0.0,
     ) -> NativeWfmCaptureResult:
-        """
-        Capture all enabled analog channels as one native WFM file.
-
-        Stops acquisition, downloads the compact native file, and writes a small JSON sidecar
-        containing channel conversion parameters and a SHA-256 digest. The capture is published
-        only after native payload geometry and a raw sample prefix from every enabled channel
-        match exactly. No per-channel waveform JSON files are transferred or created.
-        """
+        """Build and atomically publish a verified native WFM capture bundle."""
         capture_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         partial_dir = tempfile.mkdtemp(
             prefix=f".waveform_capture_{capture_id}_",
@@ -2564,59 +2752,74 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
         final_dir = os.path.join(os.path.dirname(partial_dir), final_name)
         wfm_path = os.path.join(partial_dir, "data.wfm")
         metadata_path = os.path.join(partial_dir, "metadata.json")
+        screenshot_path = os.path.join(partial_dir, "screenshot.png")
+        progress_span = 1.0 - progress_start
+
+        def progress(fraction: float) -> float:
+            return progress_start + progress_span * fraction
 
         logger.info(
-            "capture_waveform_wfm start: capture_id=%s, verification_points=%d",
+            "native WFM bundle start: capture_id=%s, verification_points=%d, screenshot=%s",
             capture_id,
             verification_points,
+            include_screenshot,
         )
 
         try:
-            scope._write_checked(":STOP")
+            if stop_before_capture:
+                scope._write_checked(":STOP")
+            elif map_trigger_status(
+                scope._query_checked(":TRIG:STAT?").strip()
+            ) != TriggerStatus.STOPPED:
+                raise RuntimeError("Acquisition must be stopped before native WFM export")
             scope._query_checked("*OPC?")
-
+            scope_setup = _query_capture_session_snapshot()
             enabled_channels = [
-                channel
-                for channel in range(1, 5)
-                if scope._query_bool_checked(f":CHAN{channel}:DISP?")
+                entry["channel"]
+                for entry in scope_setup["channels"]
+                if entry["enabled"]
             ]
             if not enabled_channels:
                 raise RuntimeError("At least one analog channel must be enabled")
 
             wfm_path = await _save_native_wfm(
-                ctx, partial_dir, progress_start=0.05, progress_end=0.55
+                ctx,
+                partial_dir,
+                progress_start=progress(0.05),
+                progress_end=progress(0.55),
             )
 
-            memory_depth = int(float(scope._query_checked(":ACQ:MDEP?")))
+            acquisition_setup = scope_setup["acquisition"]
+            timebase_setup = scope_setup["timebase"]
+            memory_depth = acquisition_setup["memory_depth"]
             verify_count = min(verification_points, memory_depth)
             metadata = {
                 "format": WFM_SIDECAR_FORMAT,
                 "wfm_file": os.path.basename(wfm_path),
-                "identity": scope._query_checked("*IDN?").strip(),
+                "identity": scope_setup["identity"],
                 "memory_depth_per_channel": memory_depth,
-                "sample_rate": float(scope._query_checked(":ACQ:SRAT?")),
-                "time_per_div": float(scope._query_checked(":TIM:SCAL?")),
-                "time_offset": float(scope._query_checked(":TIM:OFFS?")),
+                "sample_rate": acquisition_setup["sample_rate"],
+                "time_per_div": timebase_setup["time_per_div"],
+                "time_offset": timebase_setup["time_offset"],
+                "scope_setup": scope_setup,
             }
 
             channels = []
-            for channel in range(1, 5):
-                enabled = channel in enabled_channels
+            for channel_config in scope_setup["channels"]:
+                channel = channel_config["channel"]
+                enabled = channel_config["enabled"]
                 entry = {
                     "channel": channel,
                     "enabled": enabled,
-                    "vertical_scale": float(
-                        scope._query_checked(f":CHAN{channel}:SCAL?")
-                    ),
-                    "vertical_offset": float(
-                        scope._query_checked(f":CHAN{channel}:OFFS?")
-                    ),
-                    "probe_ratio": float(
-                        scope._query_checked(f":CHAN{channel}:PROB?")
-                    ),
-                    "label": scope._query_checked(
-                        f":CHAN{channel}:LAB:CONT?"
-                    ).strip().strip('"'),
+                    "coupling": channel_config["coupling"],
+                    "probe_ratio": channel_config["probe_ratio"],
+                    "bandwidth_limit": channel_config["bandwidth_limit"],
+                    "vertical_scale": channel_config["vertical_scale"],
+                    "vertical_offset": channel_config["vertical_offset"],
+                    "inverted": channel_config["inverted"],
+                    "units": channel_config["units"],
+                    "label": channel_config["label"],
+                    "label_visible": channel_config["label_visible"],
                 }
                 if enabled:
                     scope._write_checked(f":WAV:SOUR CHAN{channel}")
@@ -2647,12 +2850,31 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
                     entry["verification_raw"] = verification_raw
                 channels.append(entry)
                 await ctx.report_progress(
-                    progress=0.6 + channel * 0.07,
+                    progress=progress(0.6 + channel * 0.06),
                     message=f"Collected compact metadata for channel {channel}",
                 )
 
             metadata["channels"] = channels
             _validate_native_wfm(wfm_path, metadata)
+
+            screenshot_saved = False
+            if include_screenshot:
+                result = await _capture_screenshot_internal(
+                    "capture",
+                    {
+                        "tool_name": "capture_waveform_wfm",
+                        "capture_id": capture_id,
+                    },
+                    output_path=screenshot_path,
+                )
+                if result is None:
+                    raise RuntimeError("Requested capture screenshot failed")
+                screenshot_saved = True
+                metadata.update(
+                    screenshot_file=os.path.basename(screenshot_path),
+                    screenshot_bytes=os.path.getsize(screenshot_path),
+                    screenshot_sha256=_sha256_file(screenshot_path),
+                )
 
             with open(metadata_path, "w", encoding="utf-8") as stream:
                 json.dump(metadata, stream, indent=2)
@@ -2661,6 +2883,11 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
             os.replace(partial_dir, final_dir)
             final_wfm_path = os.path.join(final_dir, "data.wfm")
             final_metadata_path = os.path.join(final_dir, "metadata.json")
+            final_screenshot_path = (
+                os.path.join(final_dir, "screenshot.png")
+                if screenshot_saved
+                else None
+            )
             sample_interleave = [int(value) for value in metadata["sample_interleave"]]
 
             await ctx.report_progress(
@@ -2668,7 +2895,7 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
                 message=f"Verified native WFM capture: {to_client_path(final_dir)}",
             )
             logger.info(
-                "capture_waveform_wfm complete: directory=%s, bytes=%d, channels=%s",
+                "native WFM bundle complete: directory=%s, bytes=%d, channels=%s",
                 final_dir,
                 metadata["wfm_bytes"],
                 sample_interleave,
@@ -2678,6 +2905,7 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
                 wfm_file_path=to_client_path(final_wfm_path) or final_wfm_path,
                 metadata_file_path=to_client_path(final_metadata_path)
                 or final_metadata_path,
+                screenshot_file_path=to_client_path(final_screenshot_path),
                 wfm_bytes=int(metadata["wfm_bytes"]),
                 wfm_sha256=str(metadata["wfm_sha256"]),
                 points_per_channel=memory_depth,
@@ -2691,8 +2919,96 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
             )
         except Exception:
             shutil.rmtree(partial_dir, ignore_errors=True)
-            logger.exception("capture_waveform_wfm failed")
+            logger.exception("native WFM bundle failed")
             raise
+
+    @mcp.tool
+    @with_scope_connection
+    async def capture_waveform_wfm(
+        ctx: Context,
+        verification_points: VerificationPointsField = DEFAULT_WFM_VERIFY_POINTS,
+        include_screenshot: Annotated[
+            bool,
+            Field(description="Include a screenshot in the atomic capture bundle"),
+        ] = False,
+    ) -> NativeWfmCaptureResult:
+        """
+        Capture all enabled analog channels as one native WFM bundle.
+
+        Stops acquisition, downloads the compact native file, and writes a small JSON sidecar
+        containing complete scope setup, conversion parameters, and file digests. The capture
+        is published only after native payload geometry and a raw sample prefix from every
+        enabled channel match exactly. No per-channel waveform JSON files are created.
+        """
+        return await _capture_native_wfm_bundle(
+            ctx,
+            verification_points,
+            include_screenshot,
+            stop_before_capture=True,
+        )
+
+    @mcp.tool
+    @with_scope_connection
+    async def arm_single_and_capture_wfm(
+        ctx: Context,
+        timeout_seconds: CaptureWaitTimeoutField = 120.0,
+        verification_points: VerificationPointsField = DEFAULT_WFM_VERIFY_POINTS,
+        include_screenshot: Annotated[
+            bool,
+            Field(description="Include a screenshot in the atomic capture bundle"),
+        ] = False,
+    ) -> ArmedNativeWfmCaptureResult:
+        """
+        Arm one acquisition, wait for its configured trigger, then export a native WFM bundle.
+
+        The trigger is never forced. If no trigger completes before the timeout, acquisition is
+        stopped and the call fails without creating a capture directory. This is intended for
+        externally operated transient tests after the complete scope setup has been verified.
+        """
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        last_reported_second = -1
+        scope._write_checked(":SING")
+        await asyncio.sleep(0.05)
+
+        while True:
+            raw_status = scope._query_checked(":TRIG:STAT?").strip()
+            elapsed = loop.time() - started
+            if raw_status == "STOP":
+                break
+            if elapsed >= timeout_seconds:
+                try:
+                    scope._write_checked(":STOP", raise_on_error=False)
+                    scope._query_checked("*OPC?")
+                finally:
+                    raise TimeoutError(
+                        f"Single acquisition did not complete within {timeout_seconds:g} seconds"
+                    )
+            elapsed_second = int(elapsed)
+            if elapsed_second != last_reported_second:
+                last_reported_second = elapsed_second
+                await ctx.report_progress(
+                    progress=min(0.14, 0.14 * elapsed / timeout_seconds),
+                    message=(
+                        f"Waiting for single acquisition trigger "
+                        f"({elapsed:.1f}s / {timeout_seconds:g}s)"
+                    ),
+                )
+            await asyncio.sleep(0.2)
+
+        wait_seconds = loop.time() - started
+        capture = await _capture_native_wfm_bundle(
+            ctx,
+            verification_points,
+            include_screenshot,
+            stop_before_capture=False,
+            progress_start=0.15,
+        )
+        result: ArmedNativeWfmCaptureResult = {
+            **capture,
+            "wait_seconds": wait_seconds,
+        }
+        return result
 
     # === CHANNEL CONTROL TOOLS ===
 
@@ -2742,6 +3058,48 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
             label_visible=label_visible,
         )
 
+    def _apply_channel_settings(
+        channel: int,
+        *,
+        enabled: Optional[bool] = None,
+        coupling: Optional[ChannelCoupling] = None,
+        probe_ratio: Optional[float] = None,
+        bandwidth_limit: Optional[BandwidthLimit] = None,
+        vertical_scale: Optional[float] = None,
+        vertical_offset: Optional[float] = None,
+        inverted: Optional[bool] = None,
+        units: Optional[ChannelUnits] = None,
+        label: Optional[str] = None,
+        label_visible: Optional[bool] = None,
+    ) -> None:
+        """Apply channel settings in dependency-safe order."""
+        if enabled is not None:
+            scope._write_checked(f":CHAN{channel}:DISP {'ON' if enabled else 'OFF'}")
+        if probe_ratio is not None:
+            probe_value = (
+                int(probe_ratio) if probe_ratio == int(probe_ratio) else probe_ratio
+            )
+            scope._write_checked(f":CHAN{channel}:PROB {probe_value}")
+        if coupling is not None:
+            scope._write_checked(f":CHAN{channel}:COUP {coupling}")
+        if bandwidth_limit is not None:
+            bw_value = "20M" if bandwidth_limit == BandwidthLimit.MHZ_20 else "OFF"
+            scope._write_checked(f":CHAN{channel}:BWL {bw_value}")
+        if vertical_scale is not None:
+            scope._write_checked(f":CHAN{channel}:SCAL {vertical_scale}")
+        if vertical_offset is not None:
+            scope._write_checked(f":CHAN{channel}:OFFS {vertical_offset}")
+        if inverted is not None:
+            scope._write_checked(f":CHAN{channel}:INV {'ON' if inverted else 'OFF'}")
+        if units is not None:
+            scope._write_checked(f":CHAN{channel}:UNIT {units.value}")
+        if label is not None:
+            scope._write_checked(f':CHAN{channel}:LAB:CONT "{label}"')
+        if label_visible is not None:
+            scope._write_checked(
+                f":CHAN{channel}:LAB:SHOW {'ON' if label_visible else 'OFF'}"
+            )
+
     @mcp.tool
     @with_scope_connection
     async def set_channel_config(
@@ -2764,53 +3122,19 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
         parameter not provided will remain unchanged. Returns complete channel
         configuration after applying changes.
         """
-        # Apply settings in logical order: enable first, then probe (affects scale limits), then scale/offset
-
-        # 1. Enable/disable channel
-        if enabled is not None:
-            scope._write_checked(f":CHAN{channel}:DISP {'ON' if enabled else 'OFF'}")
-
-        # 2. Probe ratio (affects scale limits)
-        if probe_ratio is not None:
-            # Convert to int if it's a whole number
-            probe_value = int(probe_ratio) if probe_ratio == int(probe_ratio) else probe_ratio
-            scope._write_checked(f":CHAN{channel}:PROB {probe_value}")
-
-        # 3. Coupling mode
-        if coupling is not None:
-            scope._write_checked(f":CHAN{channel}:COUP {coupling}")
-
-        # 4. Bandwidth limit
-        if bandwidth_limit is not None:
-            # Map enum to SCPI value
-            bw_value = "20M" if bandwidth_limit == BandwidthLimit.MHZ_20 else "OFF"
-            scope._write_checked(f":CHAN{channel}:BWL {bw_value}")
-
-        # 5. Vertical scale
-        if vertical_scale is not None:
-            scope._write_checked(f":CHAN{channel}:SCAL {vertical_scale}")
-
-        # 6. Vertical offset
-        if vertical_offset is not None:
-            scope._write_checked(f":CHAN{channel}:OFFS {vertical_offset}")
-
-        # 7. Inversion
-        if inverted is not None:
-            scope._write_checked(f":CHAN{channel}:INV {'ON' if inverted else 'OFF'}")
-
-        # 8. Display units
-        if units is not None:
-            scope._write_checked(f":CHAN{channel}:UNIT {units.value}")
-
-        # 9. Label text
-        if label is not None:
-            scope._write_checked(f':CHAN{channel}:LAB:CONT "{label}"')
-
-        # 10. Label visibility
-        if label_visible is not None:
-            scope._write_checked(f":CHAN{channel}:LAB:SHOW {'ON' if label_visible else 'OFF'}")
-
-        # Return complete configuration after changes
+        _apply_channel_settings(
+            channel,
+            enabled=enabled,
+            coupling=coupling,
+            probe_ratio=probe_ratio,
+            bandwidth_limit=bandwidth_limit,
+            vertical_scale=vertical_scale,
+            vertical_offset=vertical_offset,
+            inverted=inverted,
+            units=units,
+            label=label,
+            label_visible=label_visible,
+        )
         return _query_channel_config(channel)
 
     @mcp.tool
@@ -2863,6 +3187,374 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
 
         return result
 
+    def _query_capture_acquisition_config() -> CaptureAcquisitionConfigResult:
+        """Query the acquisition settings needed to reproduce a capture."""
+        return CaptureAcquisitionConfigResult(
+            memory_depth=int(float(scope._query_checked(":ACQ:MDEP?"))),
+            sample_rate=float(scope._query_checked(":ACQ:SRAT?")),
+            acquisition_type=map_acquisition_type(
+                scope._query_checked(":ACQ:TYPE?").strip()
+            ),
+            averages=int(scope._query_checked(":ACQ:AVER?")),
+        )
+
+    def _query_capture_trigger_config() -> CaptureTriggerConfigResult:
+        """Query generic trigger settings plus edge details when applicable."""
+        raw_status = scope._query_checked(":TRIG:STAT?").strip()
+        trigger_mode = map_trigger_mode(scope._query_checked(":TRIG:MODE?").strip())
+        result = CaptureTriggerConfigResult(
+            trigger_status=map_trigger_status(raw_status),
+            trigger_mode=trigger_mode,
+            source=None,
+            channel=None,
+            trigger_level=None,
+            trigger_slope=None,
+            trigger_coupling=map_trigger_coupling_response(
+                scope._query_checked(":TRIG:COUP?")
+            ),
+            trigger_sweep=map_trigger_sweep_response(
+                scope._query_checked(":TRIG:SWE?")
+            ),
+            holdoff_time=float(scope._query_checked(":TRIG:HOLD?")),
+            noise_reject_enabled=scope._query_bool_checked(":TRIG:NREJ?"),
+        )
+        if trigger_mode == TriggerMode.EDGE:
+            source = scope._query_checked(":TRIG:EDGE:SOUR?").strip()
+            result["source"] = source
+            if source.startswith("CHAN") or source.startswith("CH"):
+                result["channel"] = int(source[-1])
+            result["trigger_level"] = float(
+                scope._query_checked(":TRIG:EDGE:LEV?")
+            )
+            result["trigger_slope"] = map_trigger_slope_response(
+                scope._query_checked(":TRIG:EDGE:SLOP?").strip()
+            )
+        return result
+
+    def _query_capture_session_snapshot() -> CaptureSessionSnapshot:
+        """Query every setting that defines and interprets a waveform acquisition."""
+        return CaptureSessionSnapshot(
+            identity=scope._query_checked("*IDN?").strip(),
+            channels=[_query_channel_config(channel) for channel in range(1, 5)],
+            timebase=_query_timebase_config(),
+            acquisition=_query_capture_acquisition_config(),
+            trigger=_query_capture_trigger_config(),
+        )
+
+    def _apply_timebase_settings(
+        *,
+        mode: Optional[TimebaseMode] = None,
+        time_per_div: Optional[float] = None,
+        time_offset: Optional[float] = None,
+        delayed_enabled: Optional[bool] = None,
+        delayed_time_per_div: Optional[float] = None,
+        delayed_time_offset: Optional[float] = None,
+    ) -> None:
+        """Apply timebase settings in dependency-safe order."""
+        if mode is not None:
+            scope._write_checked(f":TIM:MODE {mode.value}")
+        if time_per_div is not None:
+            scope._write_checked(f":TIM:MAIN:SCAL {time_per_div}")
+        if time_offset is not None:
+            scope._write_checked(f":TIM:MAIN:OFFS {time_offset}")
+        if delayed_enabled is not None:
+            scope._write_checked(
+                f":TIM:DEL:ENAB {'ON' if delayed_enabled else 'OFF'}"
+            )
+
+        if delayed_time_per_div is None and delayed_time_offset is None:
+            return
+        current_delayed = (
+            delayed_enabled
+            if delayed_enabled is not None
+            else scope._query_bool_checked(":TIM:DEL:ENAB?")
+        )
+        if not current_delayed:
+            raise ValueError(
+                "Cannot set delayed timebase parameters while delayed timebase is disabled"
+            )
+        effective_main_scale = (
+            float(time_per_div)
+            if time_per_div is not None
+            else float(scope._query_checked(":TIM:MAIN:SCAL?"))
+        )
+        if (
+            delayed_time_per_div is not None
+            and delayed_time_per_div > effective_main_scale
+        ):
+            raise ValueError(
+                f"Delayed timebase scale ({delayed_time_per_div} s/div) cannot exceed "
+                f"main timebase scale ({effective_main_scale} s/div)"
+            )
+        if delayed_time_per_div is not None:
+            scope._write_checked(f":TIM:DEL:SCAL {delayed_time_per_div}")
+        if delayed_time_offset is not None:
+            scope._write_checked(f":TIM:DEL:OFFS {delayed_time_offset}")
+
+    def _apply_acquisition_setup(setup: CaptureAcquisitionSetup) -> None:
+        """Apply acquisition settings in dependency-safe order."""
+        type_map = {
+            AcquisitionType.NORMAL: "NORMal",
+            AcquisitionType.AVERAGE: "AVERages",
+            AcquisitionType.PEAK: "PEAK",
+            AcquisitionType.ULTRA: "ULTRa",
+        }
+        scope._write_checked(f":ACQ:TYPE {type_map[setup.acquisition_type]}")
+        if setup.averages is not None:
+            scope._write_checked(f":ACQ:AVER {setup.averages}")
+        scope._write_checked(f":ACQ:MDEP {setup.memory_depth.value}")
+
+    def _apply_edge_trigger_setup(setup: CaptureEdgeTriggerSetup) -> None:
+        """Apply complete edge-trigger settings without arming acquisition."""
+        slope_map = {
+            TriggerSlope.POSITIVE: "POS",
+            TriggerSlope.NEGATIVE: "NEG",
+            TriggerSlope.EITHER: "RFAL",
+        }
+        scope._write_checked(":TRIG:MODE EDGE")
+        scope._write_checked(f":TRIG:EDGE:SOUR CHAN{setup.channel}")
+        scope._write_checked(f":TRIG:COUP {setup.trigger_coupling}")
+        scope._write_checked(f":TRIG:EDGE:SLOP {slope_map[setup.trigger_slope]}")
+        scope._write_checked(f":TRIG:EDGE:LEV {setup.trigger_level}")
+        scope._write_checked(f":TRIG:HOLD {setup.holdoff_time}")
+        scope._write_checked(
+            f":TRIG:NREJ {'ON' if setup.noise_reject_enabled else 'OFF'}"
+        )
+        scope._write_checked(f":TRIG:SWE {setup.trigger_sweep.value}")
+
+    def _capture_session_differences(
+        channels: List[CaptureChannelSetup],
+        timebase: CaptureTimebaseSetup,
+        acquisition: CaptureAcquisitionSetup,
+        trigger: CaptureEdgeTriggerSetup,
+        actual: CaptureSessionSnapshot,
+    ) -> List[str]:
+        """Describe any meaningful requested-versus-readback differences."""
+        differences: List[str] = []
+
+        def compare(path: str, expected, observed) -> None:
+            if expected is None or observed is None:
+                if expected is not observed:
+                    differences.append(
+                        f"{path}: requested {expected}, read back {observed}"
+                    )
+                return
+            if isinstance(expected, float) or isinstance(observed, float):
+                if not math.isclose(
+                    float(expected), float(observed), rel_tol=1e-6, abs_tol=1e-12
+                ):
+                    differences.append(f"{path}: requested {expected}, read back {observed}")
+            elif expected != observed:
+                differences.append(f"{path}: requested {expected}, read back {observed}")
+
+        actual_channels = {entry["channel"]: entry for entry in actual["channels"]}
+        channel_fields = (
+            "enabled",
+            "coupling",
+            "probe_ratio",
+            "bandwidth_limit",
+            "vertical_scale",
+            "vertical_offset",
+            "inverted",
+            "units",
+            "label",
+            "label_visible",
+        )
+        for requested_channel in channels:
+            observed_channel = actual_channels[requested_channel.channel]
+            for field_name in channel_fields:
+                compare(
+                    f"channel[{requested_channel.channel}].{field_name}",
+                    getattr(requested_channel, field_name),
+                    observed_channel[field_name],
+                )
+
+        observed_timebase = actual["timebase"]
+        for field_name in (
+            "mode",
+            "time_per_div",
+            "time_offset",
+            "delayed_enabled",
+        ):
+            compare(
+                f"timebase.{field_name}",
+                getattr(timebase, field_name),
+                observed_timebase[field_name],
+            )
+        if timebase.delayed_enabled:
+            compare(
+                "timebase.delayed_time_per_div",
+                timebase.delayed_time_per_div,
+                observed_timebase.get("delayed_time_per_div"),
+            )
+            compare(
+                "timebase.delayed_time_offset",
+                timebase.delayed_time_offset,
+                observed_timebase.get("delayed_time_offset"),
+            )
+
+        observed_acquisition = actual["acquisition"]
+        compare(
+            "acquisition.acquisition_type",
+            acquisition.acquisition_type,
+            observed_acquisition["acquisition_type"],
+        )
+        memory_points = {
+            MemoryDepth.K1: 1_000,
+            MemoryDepth.K10: 10_000,
+            MemoryDepth.K100: 100_000,
+            MemoryDepth.M1: 1_000_000,
+            MemoryDepth.M5: 5_000_000,
+            MemoryDepth.M10: 10_000_000,
+            MemoryDepth.M25: 25_000_000,
+            MemoryDepth.M50: 50_000_000,
+        }
+        if acquisition.memory_depth != MemoryDepth.AUTO:
+            compare(
+                "acquisition.memory_depth",
+                memory_points[acquisition.memory_depth],
+                observed_acquisition["memory_depth"],
+            )
+        if acquisition.averages is not None:
+            compare(
+                "acquisition.averages",
+                acquisition.averages,
+                observed_acquisition["averages"],
+            )
+
+        observed_trigger = actual["trigger"]
+        compare("trigger.trigger_mode", TriggerMode.EDGE, observed_trigger["trigger_mode"])
+        compare("trigger.channel", trigger.channel, observed_trigger["channel"])
+        compare(
+            "trigger.trigger_level",
+            trigger.trigger_level,
+            observed_trigger["trigger_level"],
+        )
+        compare(
+            "trigger.trigger_slope",
+            trigger.trigger_slope,
+            observed_trigger["trigger_slope"],
+        )
+        compare(
+            "trigger.trigger_coupling",
+            trigger.trigger_coupling,
+            observed_trigger["trigger_coupling"],
+        )
+        compare(
+            "trigger.trigger_sweep",
+            trigger.trigger_sweep,
+            observed_trigger["trigger_sweep"],
+        )
+        compare(
+            "trigger.holdoff_time",
+            trigger.holdoff_time,
+            observed_trigger["holdoff_time"],
+        )
+        compare(
+            "trigger.noise_reject_enabled",
+            trigger.noise_reject_enabled,
+            observed_trigger["noise_reject_enabled"],
+        )
+        return differences
+
+    @mcp.tool
+    @with_scope_connection
+    async def get_capture_session_config() -> CaptureSessionSnapshot:
+        """
+        Read the complete channel, timebase, acquisition, and trigger setup.
+
+        This returns the same normalized setup snapshot embedded in native WFM sidecars.
+        """
+        return _query_capture_session_snapshot()
+
+    @mcp.tool
+    @with_scope_connection
+    async def configure_capture_session(
+        channels: Annotated[
+            List[CaptureChannelSetup],
+            Field(description="Complete setup for channels 1 through 4"),
+        ],
+        timebase: CaptureTimebaseSetup,
+        acquisition: CaptureAcquisitionSetup,
+        trigger: CaptureEdgeTriggerSetup,
+    ) -> CaptureSessionConfigResult:
+        """
+        Apply and verify a complete deterministic capture setup in one call.
+
+        All four channels must be present exactly once. Acquisition is stopped before any
+        setting changes. The result contains the normalized request, full instrument readback,
+        and any settings that the instrument quantized or rejected.
+        """
+        channel_numbers = [entry.channel for entry in channels]
+        if sorted(channel_numbers) != [1, 2, 3, 4]:
+            raise ValueError("channels must contain channels 1, 2, 3, and 4 exactly once")
+        enabled_by_channel = {entry.channel: entry.enabled for entry in channels}
+        if not enabled_by_channel[trigger.channel]:
+            raise ValueError("The trigger source channel must be enabled")
+        if acquisition.acquisition_type == AcquisitionType.AVERAGE and acquisition.averages is None:
+            raise ValueError("Average acquisition requires an averages value")
+        if timebase.delayed_enabled:
+            if (
+                timebase.delayed_time_per_div is None
+                or timebase.delayed_time_offset is None
+            ):
+                raise ValueError(
+                    "Enabled delayed timebase requires both delayed scale and offset"
+                )
+        elif (
+            timebase.delayed_time_per_div is not None
+            or timebase.delayed_time_offset is not None
+        ):
+            raise ValueError(
+                "Delayed scale and offset must be omitted when delayed timebase is disabled"
+            )
+
+        scope._write_checked(":STOP")
+        scope._query_checked("*OPC?")
+        for channel_setup in sorted(channels, key=lambda entry: entry.channel):
+            _apply_channel_settings(
+                channel_setup.channel,
+                enabled=channel_setup.enabled,
+                coupling=channel_setup.coupling,
+                probe_ratio=channel_setup.probe_ratio,
+                bandwidth_limit=channel_setup.bandwidth_limit,
+                vertical_scale=channel_setup.vertical_scale,
+                vertical_offset=channel_setup.vertical_offset,
+                inverted=channel_setup.inverted,
+                units=channel_setup.units,
+                label=channel_setup.label,
+                label_visible=channel_setup.label_visible,
+            )
+        _apply_timebase_settings(
+            mode=timebase.mode,
+            time_per_div=timebase.time_per_div,
+            time_offset=timebase.time_offset,
+            delayed_enabled=timebase.delayed_enabled,
+            delayed_time_per_div=timebase.delayed_time_per_div,
+            delayed_time_offset=timebase.delayed_time_offset,
+        )
+        _apply_acquisition_setup(acquisition)
+        _apply_edge_trigger_setup(trigger)
+        actual = _query_capture_session_snapshot()
+        differences = _capture_session_differences(
+            channels, timebase, acquisition, trigger, actual
+        )
+        requested = {
+            "channels": [
+                entry.model_dump(mode="json")
+                for entry in sorted(channels, key=lambda item: item.channel)
+            ],
+            "timebase": timebase.model_dump(mode="json"),
+            "acquisition": acquisition.model_dump(mode="json"),
+            "trigger": trigger.model_dump(mode="json"),
+        }
+        return CaptureSessionConfigResult(
+            requested=requested,
+            actual=actual,
+            differences=differences,
+            verified=not differences,
+        )
+
     @mcp.tool
     @with_scope_connection
     async def get_timebase_config() -> TimebaseConfigResult:
@@ -2888,52 +3580,14 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
 
         Returns complete timebase configuration after applying changes.
         """
-        # Apply parameters in dependency order
-
-        # 1. Mode first (affects what's valid - ROLL disables delayed)
-        if mode is not None:
-            scope._write_checked(f":TIM:MODE {mode.value}")
-
-        # 2. Main timebase (scale before offset for valid ranges)
-        if time_per_div is not None:
-            scope._write_checked(f":TIM:MAIN:SCAL {time_per_div}")
-
-        if time_offset is not None:
-            scope._write_checked(f":TIM:MAIN:OFFS {time_offset}")
-
-        # 3. Delayed enable/disable
-        if delayed_enabled is not None:
-            scope._write_checked(f":TIM:DEL:ENAB {'ON' if delayed_enabled else 'OFF'}")
-
-        # 4. Delayed parameters (only if being enabled or already enabled)
-        # Query current delayed state to determine if we can set delayed parameters
-        if delayed_time_per_div is not None or delayed_time_offset is not None:
-            current_delayed = delayed_enabled if delayed_enabled is not None else scope._query_bool_checked(":TIM:DEL:ENAB?")
-
-            if delayed_time_per_div is not None:
-                if not current_delayed:
-                    raise ValueError("Cannot set delayed timebase scale when delayed timebase is disabled")
-
-                # Validate delayed scale doesn't exceed main scale
-                effective_main_scale = (
-                    float(time_per_div)
-                    if time_per_div is not None
-                    else float(scope._query_checked(":TIM:MAIN:SCAL?"))
-                )
-                if delayed_time_per_div > effective_main_scale:
-                    raise ValueError(
-                        f"Delayed timebase scale ({delayed_time_per_div} s/div) cannot exceed "
-                        f"main timebase scale ({effective_main_scale} s/div)"
-                    )
-
-                scope._write_checked(f":TIM:DEL:SCAL {delayed_time_per_div}")
-
-            if delayed_time_offset is not None:
-                if not current_delayed:
-                    raise ValueError("Cannot set delayed timebase offset when delayed timebase is disabled")
-                scope._write_checked(f":TIM:DEL:OFFS {delayed_time_offset}")
-
-        # Return complete updated configuration
+        _apply_timebase_settings(
+            mode=mode,
+            time_per_div=time_per_div,
+            time_offset=time_offset,
+            delayed_enabled=delayed_enabled,
+            delayed_time_per_div=delayed_time_per_div,
+            delayed_time_offset=delayed_time_offset,
+        )
         return _query_timebase_config()
 
     # === ACQUISITION CONTROL TOOLS ===
@@ -3259,19 +3913,9 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
         # Verify the setting
         actual_coupling = scope._query_checked(":TRIG:COUP?").strip()
 
-        # Map SCPI response back to user-friendly format
-        # DHO800 may return abbreviated forms
-        coupling_map = {
-            "AC": "AC",
-            "DC": "DC",
-            "LFREJ": "LFReject",
-            "LFR": "LFReject",
-            "HFREJ": "HFReject",
-            "HFR": "HFReject",
-        }
-        result_coupling = coupling_map.get(actual_coupling.upper(), coupling)
-
-        return TriggerCouplingResult(trigger_coupling=result_coupling)  # type: ignore[typeddict-item]
+        return TriggerCouplingResult(
+            trigger_coupling=map_trigger_coupling_response(actual_coupling)
+        )
 
     @mcp.tool
     @with_scope_connection
@@ -3299,24 +3943,16 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
         # Verify the setting
         actual_sweep = scope._query_checked(":TRIG:SWE?").strip()
 
-        # Map response back to enum
-        sweep_map = {
-            "AUTO": TriggerSweep.AUTO,
-            "NORM": TriggerSweep.NORMAL,
-            "NORMAL": TriggerSweep.NORMAL,
-            "SING": TriggerSweep.SINGLE,
-            "SINGLE": TriggerSweep.SINGLE,
-        }
-        result_sweep = sweep_map.get(actual_sweep.upper(), sweep_mode)
-
-        return TriggerSweepResult(trigger_sweep=result_sweep)
+        return TriggerSweepResult(
+            trigger_sweep=map_trigger_sweep_response(actual_sweep)
+        )
 
     @mcp.tool
     @with_scope_connection
     async def configure_trigger_holdoff(
         holdoff_time: Annotated[
             float,
-            Field(description="Trigger holdoff time in seconds (16ns to 10s)"),
+            Field(description="Trigger holdoff time in seconds (8ns to 10s)"),
         ]
     ) -> TriggerHoldoffResult:
         """
@@ -3329,9 +3965,9 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
         - Stable triggering on complex waveforms with multiple edges
         """
         # Validate range
-        if holdoff_time < 16e-9 or holdoff_time > 10:
+        if holdoff_time < 8e-9 or holdoff_time > 10:
             raise ValueError(
-                f"Holdoff time must be between 16ns and 10s, got {holdoff_time}s"
+                f"Holdoff time must be between 8ns and 10s, got {holdoff_time}s"
             )
 
         scope._write_checked(f":TRIG:HOLD {holdoff_time}")

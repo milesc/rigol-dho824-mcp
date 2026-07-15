@@ -4,7 +4,14 @@ import struct
 import tempfile
 import unittest
 
-from rigol_dho824_mcp.server import _validate_native_wfm
+from pydantic import ValidationError
+
+from rigol_dho824_mcp.server import (
+    CaptureEdgeTriggerSetup,
+    TriggerSlope,
+    TriggerSweep,
+    _validate_native_wfm,
+)
 
 
 def _write_wfm(path):
@@ -55,6 +62,27 @@ class NativeWfmValidationTests(unittest.TestCase):
                 RuntimeError, "CH3 WFM verification mismatch at 1"
             ):
                 _validate_native_wfm(str(wfm_path), metadata)
+
+    def test_edge_trigger_setup_accepts_documented_minimum_holdoff(self):
+        setup = CaptureEdgeTriggerSetup(
+            channel=1,
+            trigger_level=1.0,
+            trigger_slope=TriggerSlope.POSITIVE,
+            trigger_sweep="NORMAL",
+            holdoff_time=8e-9,
+        )
+
+        self.assertEqual(setup.trigger_sweep, TriggerSweep.NORMAL)
+        self.assertEqual(setup.holdoff_time, 8e-9)
+
+    def test_edge_trigger_setup_rejects_subminimum_holdoff(self):
+        with self.assertRaises(ValidationError):
+            CaptureEdgeTriggerSetup(
+                channel=1,
+                trigger_level=1.0,
+                trigger_slope=TriggerSlope.POSITIVE,
+                holdoff_time=7e-9,
+            )
 
 
 if __name__ == "__main__":
