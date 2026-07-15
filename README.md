@@ -152,6 +152,19 @@ Capture a waveform from channel 1 of my oscilloscope
 
 Your MCP client should connect to the oscilloscope and capture the waveform data.
 
+### Fast native WFM capture
+
+Use the `capture_waveform_wfm` tool when you want the oscilloscope's compact native
+acquisition without transferring enormous per-channel JSON arrays. One call stops the
+acquisition, saves every enabled analog channel in `data.wfm`, and writes a compact
+`metadata.json` sidecar with conversion parameters, channel order, file size, and SHA-256.
+
+Before publishing the capture directory, the server checks the native payload geometry and
+requires an exact raw-sample match for every enabled channel. The optional
+`verification_points` argument defaults to 1,024 points per channel. The result returns the
+capture directory, both file paths, enabled-channel order, point count, byte count, digest,
+and verification status.
+
 ### Accessing Temp Files in Docker
 
 The container writes temporary files (waveform captures, screenshots) to `/tmp/rigol` internally. To access these files from your host machine:

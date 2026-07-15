@@ -5,9 +5,12 @@ import functools
 import hashlib
 import inspect
 import io
+import mmap
 import os
 import random
+import shutil
 import string
+import struct
 import tempfile
 import json
 from datetime import datetime
@@ -40,6 +43,9 @@ logger = get_logger(__name__)
 _BOOL_TRUE = {"1", "ON", "TRUE", "YES"}
 _BOOL_FALSE = {"0", "OFF", "FALSE", "NO"}
 
+WFM_SIDECAR_FORMAT = "rigol-dho824-wfm-sidecar-v1"
+DEFAULT_WFM_VERIFY_POINTS = 1024
+
 
 def _parse_scpi_bool(value: str) -> bool:
     """
@@ -55,6 +61,69 @@ def _parse_scpi_bool(value: str) -> bool:
         return False
     logger.warning("Unexpected boolean response from oscilloscope: %r", value)
     raise ValueError(f"Unexpected boolean response from oscilloscope: {value!r}")
+
+
+def _sha256_file(path: str) -> str:
+    """Return the SHA-256 digest of a file without loading it all into memory."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_native_wfm(wfm_path: str, metadata: dict) -> None:
+    """Validate native sample geometry and add immutable file metadata to a sidecar."""
+    enabled = [entry for entry in metadata["channels"] if entry["enabled"]]
+    if not enabled:
+        raise RuntimeError("The WFM contains no enabled analog channels")
+
+    points = int(metadata["memory_depth_per_channel"])
+    payload_bytes = points * len(enabled) * 2
+    wfm_bytes = os.path.getsize(wfm_path)
+    data_offset = wfm_bytes - payload_bytes
+    if data_offset < 40:
+        raise RuntimeError("WFM is too small for the expected sample payload")
+
+    with open(wfm_path, "rb") as stream, mmap.mmap(
+        stream.fileno(), 0, access=mmap.ACCESS_READ
+    ) as image:
+        header_count = struct.unpack_from("<Q", image, data_offset - 40)[0]
+        expected_count = points * len(enabled)
+        if header_count != expected_count:
+            raise RuntimeError(
+                f"WFM header count {header_count} != expected {expected_count}"
+            )
+
+        for slot, entry in enumerate(enabled):
+            expected = entry.pop("verification_raw")
+            actual = [
+                struct.unpack_from(
+                    "<H",
+                    image,
+                    data_offset + 2 * (index * len(enabled) + slot),
+                )[0]
+                for index in range(len(expected))
+            ]
+            entry["verification_points"] = len(expected)
+            entry["verification_exact_match"] = actual == expected
+            if actual != expected:
+                mismatch = next(
+                    index
+                    for index, pair in enumerate(zip(actual, expected))
+                    if pair[0] != pair[1]
+                )
+                raise RuntimeError(
+                    f"CH{entry['channel']} WFM verification mismatch at {mismatch}: "
+                    f"WFM={actual[mismatch]} instrument={expected[mismatch]}"
+                )
+
+    metadata.update(
+        wfm_bytes=wfm_bytes,
+        wfm_sha256=_sha256_file(wfm_path),
+        sample_data_offset=data_offset,
+        sample_interleave=[entry["channel"] for entry in enabled],
+    )
 
 
 # === ENUMS FOR CONSTRAINED VALUES ===
@@ -922,6 +991,37 @@ class WaveformCaptureResult(TypedDict, total=False):
         Field(
             description="Error message if WFM file download failed. Provides detailed information about the failure (file not found, hash mismatch, network error, etc.)."
         ),
+    ]
+
+
+class NativeWfmCaptureResult(TypedDict):
+    """Result for a compact native WFM capture and verified metadata sidecar."""
+
+    capture_directory: Annotated[
+        str, Field(description="Directory containing the completed capture")
+    ]
+    wfm_file_path: Annotated[
+        str, Field(description="File path to the native all-channel WFM file")
+    ]
+    metadata_file_path: Annotated[
+        str, Field(description="File path to the compact JSON metadata sidecar")
+    ]
+    wfm_bytes: Annotated[int, Field(description="Size of the WFM file in bytes")]
+    wfm_sha256: Annotated[
+        str, Field(description="SHA-256 digest of the completed WFM file")
+    ]
+    points_per_channel: Annotated[
+        int, Field(description="Number of waveform points stored for each enabled channel")
+    ]
+    channels: Annotated[
+        List[ChannelNumber],
+        Field(description="Enabled channels in native sample-interleave order"),
+    ]
+    verification_points: Annotated[
+        int, Field(description="Number of raw points verified for every enabled channel")
+    ]
+    verified: Annotated[
+        bool, Field(description="Whether all channel verification samples matched exactly")
     ]
 
 
@@ -2145,6 +2245,49 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
         }
         return channel_map.get(scpi_source, 1)
 
+    async def _save_native_wfm(
+        ctx: Context,
+        capture_dir: str,
+        progress_start: float = 0.0,
+        progress_end: float = 1.0,
+    ) -> str:
+        """Save every enabled channel as one native WFM and download it with verification."""
+        remote_stem = "".join(
+            random.choices(string.ascii_lowercase + string.digits, k=10)
+        )
+        remote_filename = f"{remote_stem}.wfm"
+        remote_path = f"C:/{remote_filename}"
+        local_path = os.path.join(capture_dir, "data.wfm")
+        progress_span = progress_end - progress_start
+
+        await ctx.report_progress(
+            progress=progress_start,
+            message="Saving native WFM file on oscilloscope...",
+        )
+        scope._write_checked(":SAVE:OVER ON")
+        scope._write_checked(f":SAVE:MEMory:WAVeform {remote_path}")
+        await scope._wait_for_save_completion(timeout=600.0)
+
+        ip_address = scope.extract_ip_from_resource()
+        if not ip_address:
+            raise RuntimeError("Native WFM download requires a network connection")
+
+        await ctx.report_progress(
+            progress=progress_start + progress_span * 0.5,
+            message="Downloading and verifying native WFM file...",
+        )
+        success, error = scope.download_file_via_ftp(
+            ip_address, remote_filename, local_path
+        )
+        if not success:
+            raise RuntimeError(error or "Native WFM download failed")
+
+        await ctx.report_progress(
+            progress=progress_end,
+            message=f"Native WFM file saved: {to_client_path(local_path)}",
+        )
+        return local_path
+
     # === WAVEFORM CAPTURE TOOLS ===
 
     @mcp.tool
@@ -2364,48 +2507,11 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
         wfm_saved_path: Optional[str] = None
         wfm_error_msg: Optional[str] = None
 
-        # Generate random 10-char string to avoid overwriting
-        wfm_filename = f"{''.join(random.choices(string.ascii_lowercase + string.digits, k=10))}.wfm"
-        wfm_scope_path = f"C:/{wfm_filename}"
-        wfm_local_path = os.path.join(capture_dir, "data.wfm")
-
         # Try to save and download WFM via FTP (gracefully skip if FTP unavailable)
         try:
-            await ctx.report_progress(
-                progress=1.0, message="Saving WFM file on scope..."
+            wfm_saved_path = await _save_native_wfm(
+                ctx, capture_dir, progress_start=1.0, progress_end=1.0
             )
-
-            # Enable file overwriting
-            scope._write_checked(":SAVE:OVER ON")
-
-            # Save memory waveform to scope and wait for completion
-            scope._write_checked(f":SAVE:MEMory:WAVeform {wfm_scope_path}")
-            await scope._wait_for_save_completion(timeout=600.0)
-
-            # Try to download via FTP
-            ip_address = scope.extract_ip_from_resource()
-            if ip_address:
-                await ctx.report_progress(
-                    progress=1.0, message="Downloading WFM file via FTP..."
-                )
-                success, error = scope.download_file_via_ftp(ip_address, wfm_filename, wfm_local_path)
-                if success:
-                    wfm_saved_path = wfm_local_path
-                    await ctx.report_progress(
-                        progress=1.0, message=f"WFM file saved: {to_client_path(wfm_local_path)}"
-                    )
-                else:
-                    wfm_error_msg = error
-                    await ctx.report_progress(
-                        progress=1.0,
-                        message=f"WFM download failed: {error}",
-                    )
-            else:
-                wfm_error_msg = "Not a network connection (FTP not available)"
-                await ctx.report_progress(
-                    progress=1.0,
-                    message="WFM download skipped (not a network connection)",
-                )
 
         except Exception as e:
             # WFM capture failed - report but don't fail the whole operation
@@ -2425,6 +2531,168 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
             wfm_file_path=to_client_path(wfm_saved_path),
             wfm_error=wfm_error_msg,
         )
+
+    @mcp.tool
+    @with_scope_connection
+    async def capture_waveform_wfm(
+        ctx: Context,
+        verification_points: Annotated[
+            int,
+            Field(
+                ge=1,
+                le=10000,
+                description="Raw points to verify per enabled channel",
+            ),
+        ] = DEFAULT_WFM_VERIFY_POINTS,
+    ) -> NativeWfmCaptureResult:
+        """
+        Capture all enabled analog channels as one native WFM file.
+
+        Stops acquisition, downloads the compact native file, and writes a small JSON sidecar
+        containing channel conversion parameters and a SHA-256 digest. The capture is published
+        only after native payload geometry and a raw sample prefix from every enabled channel
+        match exactly. No per-channel waveform JSON files are transferred or created.
+        """
+        capture_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        partial_dir = tempfile.mkdtemp(
+            prefix=f".waveform_capture_{capture_id}_",
+            suffix="_wfm_only.partial",
+            dir=temp_dir,
+        )
+        partial_name = os.path.basename(partial_dir)
+        final_name = partial_name[1:].removesuffix(".partial")
+        final_dir = os.path.join(os.path.dirname(partial_dir), final_name)
+        wfm_path = os.path.join(partial_dir, "data.wfm")
+        metadata_path = os.path.join(partial_dir, "metadata.json")
+
+        logger.info(
+            "capture_waveform_wfm start: capture_id=%s, verification_points=%d",
+            capture_id,
+            verification_points,
+        )
+
+        try:
+            scope._write_checked(":STOP")
+            scope._query_checked("*OPC?")
+
+            enabled_channels = [
+                channel
+                for channel in range(1, 5)
+                if scope._query_bool_checked(f":CHAN{channel}:DISP?")
+            ]
+            if not enabled_channels:
+                raise RuntimeError("At least one analog channel must be enabled")
+
+            wfm_path = await _save_native_wfm(
+                ctx, partial_dir, progress_start=0.05, progress_end=0.55
+            )
+
+            memory_depth = int(float(scope._query_checked(":ACQ:MDEP?")))
+            verify_count = min(verification_points, memory_depth)
+            metadata = {
+                "format": WFM_SIDECAR_FORMAT,
+                "wfm_file": os.path.basename(wfm_path),
+                "identity": scope._query_checked("*IDN?").strip(),
+                "memory_depth_per_channel": memory_depth,
+                "sample_rate": float(scope._query_checked(":ACQ:SRAT?")),
+                "time_per_div": float(scope._query_checked(":TIM:SCAL?")),
+                "time_offset": float(scope._query_checked(":TIM:OFFS?")),
+            }
+
+            channels = []
+            for channel in range(1, 5):
+                enabled = channel in enabled_channels
+                entry = {
+                    "channel": channel,
+                    "enabled": enabled,
+                    "vertical_scale": float(
+                        scope._query_checked(f":CHAN{channel}:SCAL?")
+                    ),
+                    "vertical_offset": float(
+                        scope._query_checked(f":CHAN{channel}:OFFS?")
+                    ),
+                    "probe_ratio": float(
+                        scope._query_checked(f":CHAN{channel}:PROB?")
+                    ),
+                    "label": scope._query_checked(
+                        f":CHAN{channel}:LAB:CONT?"
+                    ).strip().strip('"'),
+                }
+                if enabled:
+                    scope._write_checked(f":WAV:SOUR CHAN{channel}")
+                    scope._write_checked(":WAV:MODE RAW")
+                    scope._write_checked(":WAV:FORM WORD")
+                    entry.update(
+                        y_increment=float(scope._query_checked(":WAV:YINC?")),
+                        y_origin=float(scope._query_checked(":WAV:YOR?")),
+                        y_reference=float(scope._query_checked(":WAV:YREF?")),
+                        x_increment=float(scope._query_checked(":WAV:XINC?")),
+                        x_origin=float(scope._query_checked(":WAV:XOR?")),
+                    )
+                    scope._write_checked(":WAV:STAR 1")
+                    scope._write_checked(f":WAV:STOP {verify_count}")
+                    raw_values = scope._query_binary_values_checked(
+                        ":WAV:DATA?", datatype="H", is_big_endian=False
+                    )
+                    if isinstance(raw_values, bytes):
+                        raise RuntimeError(
+                            f"CH{channel} verification returned packed bytes instead of words"
+                        )
+                    verification_raw = [int(value) for value in raw_values]
+                    if len(verification_raw) != verify_count:
+                        raise RuntimeError(
+                            f"CH{channel} verification returned {len(verification_raw)} "
+                            f"points, expected {verify_count}"
+                        )
+                    entry["verification_raw"] = verification_raw
+                channels.append(entry)
+                await ctx.report_progress(
+                    progress=0.6 + channel * 0.07,
+                    message=f"Collected compact metadata for channel {channel}",
+                )
+
+            metadata["channels"] = channels
+            _validate_native_wfm(wfm_path, metadata)
+
+            with open(metadata_path, "w", encoding="utf-8") as stream:
+                json.dump(metadata, stream, indent=2)
+                stream.write("\n")
+
+            os.replace(partial_dir, final_dir)
+            final_wfm_path = os.path.join(final_dir, "data.wfm")
+            final_metadata_path = os.path.join(final_dir, "metadata.json")
+            sample_interleave = [int(value) for value in metadata["sample_interleave"]]
+
+            await ctx.report_progress(
+                progress=1.0,
+                message=f"Verified native WFM capture: {to_client_path(final_dir)}",
+            )
+            logger.info(
+                "capture_waveform_wfm complete: directory=%s, bytes=%d, channels=%s",
+                final_dir,
+                metadata["wfm_bytes"],
+                sample_interleave,
+            )
+            return NativeWfmCaptureResult(
+                capture_directory=to_client_path(final_dir) or final_dir,
+                wfm_file_path=to_client_path(final_wfm_path) or final_wfm_path,
+                metadata_file_path=to_client_path(final_metadata_path)
+                or final_metadata_path,
+                wfm_bytes=int(metadata["wfm_bytes"]),
+                wfm_sha256=str(metadata["wfm_sha256"]),
+                points_per_channel=memory_depth,
+                channels=sample_interleave,
+                verification_points=verify_count,
+                verified=all(
+                    entry.get("verification_exact_match", False)
+                    for entry in channels
+                    if entry["enabled"]
+                ),
+            )
+        except Exception:
+            shutil.rmtree(partial_dir, ignore_errors=True)
+            logger.exception("capture_waveform_wfm failed")
+            raise
 
     # === CHANNEL CONTROL TOOLS ===
 
