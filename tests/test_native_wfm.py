@@ -8,8 +8,12 @@ from pydantic import ValidationError
 
 from rigol_dho824_mcp.server import (
     CaptureEdgeTriggerSetup,
+    CapturePulseTriggerSetup,
     TriggerSlope,
     TriggerSweep,
+    _normalize_pulse_polarity,
+    _normalize_pulse_width_condition,
+    _pulse_width_write_commands,
     _validate_native_wfm,
 )
 
@@ -34,6 +38,54 @@ def _metadata():
 
 
 class NativeWfmValidationTests(unittest.TestCase):
+    def test_normalizes_pulse_trigger_readbacks(self):
+        self.assertEqual(_normalize_pulse_polarity("NEG"), "NEGATIVE")
+        self.assertEqual(_normalize_pulse_polarity("POSitive"), "POSITIVE")
+        self.assertEqual(_normalize_pulse_width_condition("GRE"), "GREATER")
+        self.assertEqual(_normalize_pulse_width_condition("LESS"), "LESS")
+        self.assertEqual(_normalize_pulse_width_condition("GLES"), "WITHIN")
+
+    def test_rejects_unknown_pulse_trigger_readbacks(self):
+        with self.assertRaises(ValueError):
+            _normalize_pulse_polarity("MAYBE")
+        with self.assertRaises(ValueError):
+            _normalize_pulse_width_condition("MAYBE")
+
+    def test_greater_pulse_uses_lower_width_register(self):
+        self.assertEqual(
+            _pulse_width_write_commands("GREATER", 2.5e-6, None),
+            [(":TRIG:PULS:LWID", 2.5e-6)],
+        )
+
+    def test_pulse_capture_setup_validates_active_width_limits(self):
+        setup = CapturePulseTriggerSetup(
+            channel=4,
+            trigger_level=-0.1,
+            pulse_polarity="NEGATIVE",
+            pulse_width_condition="GREATER",
+            pulse_lower_width=2.5e-6,
+        )
+        self.assertEqual(setup.pulse_lower_width, 2.5e-6)
+
+        with self.assertRaises(ValidationError):
+            CapturePulseTriggerSetup(
+                channel=4,
+                trigger_level=-0.1,
+                pulse_polarity="NEGATIVE",
+                pulse_width_condition="GREATER",
+                pulse_upper_width=2.5e-6,
+            )
+
+        with self.assertRaises(ValidationError):
+            CapturePulseTriggerSetup(
+                channel=4,
+                trigger_level=-0.1,
+                pulse_polarity="NEGATIVE",
+                pulse_width_condition="WITHIN",
+                pulse_lower_width=3e-6,
+                pulse_upper_width=2e-6,
+            )
+
     def test_adds_geometry_hash_and_verification(self):
         with tempfile.TemporaryDirectory() as directory:
             wfm_path = Path(directory) / "data.wfm"

@@ -21,7 +21,7 @@ from ftplib import FTP
 from typing import Optional, TypedDict, Annotated, List, Literal, cast, Union, Sequence
 from typing_extensions import NotRequired
 import numpy as np
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from fastmcp import FastMCP, Context
 from fastmcp.server.dependencies import get_context
 from fastmcp.utilities.logging import get_logger
@@ -62,6 +62,54 @@ def _parse_scpi_bool(value: str) -> bool:
         return False
     logger.warning("Unexpected boolean response from oscilloscope: %r", value)
     raise ValueError(f"Unexpected boolean response from oscilloscope: {value!r}")
+
+
+def _normalize_pulse_polarity(value: str) -> Literal["POSITIVE", "NEGATIVE"]:
+    """Normalize a pulse-trigger polarity response."""
+    normalized = value.strip().upper()
+    if normalized.startswith("POS"):
+        return "POSITIVE"
+    if normalized.startswith("NEG"):
+        return "NEGATIVE"
+    raise ValueError(f"Unexpected pulse polarity from oscilloscope: {value!r}")
+
+
+def _normalize_pulse_width_condition(
+    value: str,
+) -> Literal["GREATER", "LESS", "WITHIN"]:
+    """Normalize a pulse-trigger width-condition response."""
+    normalized = value.strip().upper()
+    if normalized.startswith("GLES"):
+        return "WITHIN"
+    if normalized.startswith("GRE"):
+        return "GREATER"
+    if normalized.startswith("LESS"):
+        return "LESS"
+    raise ValueError(f"Unexpected pulse width condition from oscilloscope: {value!r}")
+
+
+def _pulse_width_write_commands(
+    condition: Literal["GREATER", "LESS", "WITHIN"],
+    lower_width: Optional[float],
+    upper_width: Optional[float],
+) -> List[tuple[str, float]]:
+    """Return the active pulse-width setting commands in dependency-safe order."""
+    if condition == "GREATER":
+        if lower_width is None:
+            raise ValueError("GREATER pulse trigger requires lower_width")
+        return [(":TRIG:PULS:LWID", lower_width)]
+    if condition == "LESS":
+        if upper_width is None:
+            raise ValueError("LESS pulse trigger requires upper_width")
+        return [(":TRIG:PULS:UWID", upper_width)]
+    if lower_width is None or upper_width is None:
+        raise ValueError("WITHIN pulse trigger requires lower_width and upper_width")
+    if lower_width >= upper_width:
+        raise ValueError("Pulse lower_width must be less than upper_width")
+    return [
+        (":TRIG:PULS:UWID", upper_width),
+        (":TRIG:PULS:LWID", lower_width),
+    ]
 
 
 def _sha256_file(path: str) -> str:
@@ -719,14 +767,11 @@ class CaptureAcquisitionSetup(BaseModel):
     averages: Optional[AveragesCountField] = None
 
 
-class CaptureEdgeTriggerSetup(BaseModel):
-    """Complete edge-trigger setup for a capture session."""
+class CaptureTriggerSetupBase(BaseModel):
+    """Settings shared by deterministic trigger setups."""
 
     channel: ChannelNumber
     trigger_level: TriggerLevelField
-    trigger_slope: Annotated[
-        TriggerSlope, Field(description="Edge slope: POSITIVE, NEGATIVE, or EITHER")
-    ]
     trigger_coupling: Annotated[
         TriggerCouplingType,
         Field(description="Trigger coupling mode: AC, DC, LFReject, or HFReject"),
@@ -740,6 +785,51 @@ class CaptureEdgeTriggerSetup(BaseModel):
     noise_reject_enabled: Annotated[
         bool, Field(description="Whether trigger noise rejection is enabled")
     ] = False
+
+
+class CaptureEdgeTriggerSetup(CaptureTriggerSetupBase):
+    """Complete edge-trigger setup for a capture session."""
+
+    trigger_slope: Annotated[
+        TriggerSlope, Field(description="Edge slope: POSITIVE, NEGATIVE, or EITHER")
+    ]
+
+
+class CapturePulseTriggerSetup(CaptureTriggerSetupBase):
+    """Complete pulse-width-trigger setup for a capture session."""
+
+    pulse_polarity: Annotated[
+        Literal["POSITIVE", "NEGATIVE"], Field(description="Pulse polarity")
+    ]
+    pulse_width_condition: Annotated[
+        Literal["GREATER", "LESS", "WITHIN"],
+        Field(description="Pulse-width condition"),
+    ]
+    pulse_lower_width: Annotated[
+        Optional[float],
+        Field(ge=1e-9, le=10.0, description="Lower pulse-width limit in seconds"),
+    ] = None
+    pulse_upper_width: Annotated[
+        Optional[float],
+        Field(ge=1e-9, le=10.0, description="Upper pulse-width limit in seconds"),
+    ] = None
+
+    @model_validator(mode="after")
+    def validate_width_limits(self) -> "CapturePulseTriggerSetup":
+        """Require exactly the width limits active for the selected condition."""
+        _pulse_width_write_commands(
+            self.pulse_width_condition,
+            self.pulse_lower_width,
+            self.pulse_upper_width,
+        )
+        if self.pulse_width_condition == "GREATER" and self.pulse_upper_width is not None:
+            raise ValueError("GREATER pulse trigger must omit upper_width")
+        if self.pulse_width_condition == "LESS" and self.pulse_lower_width is not None:
+            raise ValueError("LESS pulse trigger must omit lower_width")
+        return self
+
+
+CaptureTriggerSetup = Union[CaptureEdgeTriggerSetup, CapturePulseTriggerSetup]
 
 
 # === PROTOCOL-SPECIFIC TYPE ALIASES ===
@@ -994,6 +1084,22 @@ class CaptureTriggerConfigResult(TypedDict):
     ]
     trigger_slope: Annotated[
         Optional[TriggerSlope], Field(description="Trigger edge slope")
+    ]
+    pulse_polarity: Annotated[
+        Optional[Literal["POSITIVE", "NEGATIVE"]],
+        Field(description="Pulse polarity when pulse triggering is selected"),
+    ]
+    pulse_width_condition: Annotated[
+        Optional[Literal["GREATER", "LESS", "WITHIN"]],
+        Field(description="Pulse-width condition when pulse triggering is selected"),
+    ]
+    pulse_lower_width: Annotated[
+        Optional[float],
+        Field(description="Active lower pulse-width limit in seconds"),
+    ]
+    pulse_upper_width: Annotated[
+        Optional[float],
+        Field(description="Active upper pulse-width limit in seconds"),
     ]
     trigger_coupling: Annotated[
         TriggerCouplingType, Field(description="Trigger coupling mode")
@@ -3199,7 +3305,7 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
         )
 
     def _query_capture_trigger_config() -> CaptureTriggerConfigResult:
-        """Query generic trigger settings plus edge details when applicable."""
+        """Query generic trigger settings plus active mode-specific details."""
         raw_status = scope._query_checked(":TRIG:STAT?").strip()
         trigger_mode = map_trigger_mode(scope._query_checked(":TRIG:MODE?").strip())
         result = CaptureTriggerConfigResult(
@@ -3209,6 +3315,10 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
             channel=None,
             trigger_level=None,
             trigger_slope=None,
+            pulse_polarity=None,
+            pulse_width_condition=None,
+            pulse_lower_width=None,
+            pulse_upper_width=None,
             trigger_coupling=map_trigger_coupling_response(
                 scope._query_checked(":TRIG:COUP?")
             ),
@@ -3229,6 +3339,29 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
             result["trigger_slope"] = map_trigger_slope_response(
                 scope._query_checked(":TRIG:EDGE:SLOP?").strip()
             )
+        elif trigger_mode == TriggerMode.PULSE:
+            source = scope._query_checked(":TRIG:PULS:SOUR?").strip()
+            result["source"] = source
+            if source.startswith("CHAN") or source.startswith("CH"):
+                result["channel"] = int(source[-1])
+            result["trigger_level"] = float(
+                scope._query_checked(":TRIG:PULS:LEV?")
+            )
+            result["pulse_polarity"] = _normalize_pulse_polarity(
+                scope._query_checked(":TRIG:PULS:POL?")
+            )
+            width_condition = _normalize_pulse_width_condition(
+                scope._query_checked(":TRIG:PULS:WHEN?")
+            )
+            result["pulse_width_condition"] = width_condition
+            if width_condition in ("GREATER", "WITHIN"):
+                result["pulse_lower_width"] = float(
+                    scope._query_checked(":TRIG:PULS:LWID?")
+                )
+            if width_condition in ("LESS", "WITHIN"):
+                result["pulse_upper_width"] = float(
+                    scope._query_checked(":TRIG:PULS:UWID?")
+                )
         return result
 
     def _query_capture_session_snapshot() -> CaptureSessionSnapshot:
@@ -3322,11 +3455,44 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
         )
         scope._write_checked(f":TRIG:SWE {setup.trigger_sweep.value}")
 
+    def _apply_pulse_trigger_setup(setup: CapturePulseTriggerSetup) -> None:
+        """Apply complete pulse-trigger settings without arming acquisition."""
+        condition_map = {
+            "GREATER": "GRE",
+            "LESS": "LESS",
+            "WITHIN": "GLES",
+        }
+        polarity_map = {
+            "POSITIVE": "POS",
+            "NEGATIVE": "NEG",
+        }
+        scope._write_checked(":TRIG:MODE PULS")
+        scope._write_checked(f":TRIG:PULS:SOUR CHAN{setup.channel}")
+        scope._write_checked(f":TRIG:COUP {setup.trigger_coupling}")
+        scope._write_checked(
+            f":TRIG:PULS:WHEN {condition_map[setup.pulse_width_condition]}"
+        )
+        for command, width in _pulse_width_write_commands(
+            setup.pulse_width_condition,
+            setup.pulse_lower_width,
+            setup.pulse_upper_width,
+        ):
+            scope._write_checked(f"{command} {width}")
+        scope._write_checked(
+            f":TRIG:PULS:POL {polarity_map[setup.pulse_polarity]}"
+        )
+        scope._write_checked(f":TRIG:PULS:LEV {setup.trigger_level}")
+        scope._write_checked(f":TRIG:HOLD {setup.holdoff_time}")
+        scope._write_checked(
+            f":TRIG:NREJ {'ON' if setup.noise_reject_enabled else 'OFF'}"
+        )
+        scope._write_checked(f":TRIG:SWE {setup.trigger_sweep.value}")
+
     def _capture_session_differences(
         channels: List[CaptureChannelSetup],
         timebase: CaptureTimebaseSetup,
         acquisition: CaptureAcquisitionSetup,
-        trigger: CaptureEdgeTriggerSetup,
+        trigger: CaptureTriggerSetup,
         actual: CaptureSessionSnapshot,
     ) -> List[str]:
         """Describe any meaningful requested-versus-readback differences."""
@@ -3423,18 +3589,45 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
             )
 
         observed_trigger = actual["trigger"]
-        compare("trigger.trigger_mode", TriggerMode.EDGE, observed_trigger["trigger_mode"])
+        requested_mode = (
+            TriggerMode.EDGE
+            if isinstance(trigger, CaptureEdgeTriggerSetup)
+            else TriggerMode.PULSE
+        )
+        compare("trigger.trigger_mode", requested_mode, observed_trigger["trigger_mode"])
         compare("trigger.channel", trigger.channel, observed_trigger["channel"])
         compare(
             "trigger.trigger_level",
             trigger.trigger_level,
             observed_trigger["trigger_level"],
         )
-        compare(
-            "trigger.trigger_slope",
-            trigger.trigger_slope,
-            observed_trigger["trigger_slope"],
-        )
+        if isinstance(trigger, CaptureEdgeTriggerSetup):
+            compare(
+                "trigger.trigger_slope",
+                trigger.trigger_slope,
+                observed_trigger["trigger_slope"],
+            )
+        else:
+            compare(
+                "trigger.pulse_polarity",
+                trigger.pulse_polarity,
+                observed_trigger["pulse_polarity"],
+            )
+            compare(
+                "trigger.pulse_width_condition",
+                trigger.pulse_width_condition,
+                observed_trigger["pulse_width_condition"],
+            )
+            compare(
+                "trigger.pulse_lower_width",
+                trigger.pulse_lower_width,
+                observed_trigger["pulse_lower_width"],
+            )
+            compare(
+                "trigger.pulse_upper_width",
+                trigger.pulse_upper_width,
+                observed_trigger["pulse_upper_width"],
+            )
         compare(
             "trigger.trigger_coupling",
             trigger.trigger_coupling,
@@ -3476,7 +3669,7 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
         ],
         timebase: CaptureTimebaseSetup,
         acquisition: CaptureAcquisitionSetup,
-        trigger: CaptureEdgeTriggerSetup,
+        trigger: CaptureTriggerSetup,
     ) -> CaptureSessionConfigResult:
         """
         Apply and verify a complete deterministic capture setup in one call.
@@ -3534,7 +3727,10 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
             delayed_time_offset=timebase.delayed_time_offset,
         )
         _apply_acquisition_setup(acquisition)
-        _apply_edge_trigger_setup(trigger)
+        if isinstance(trigger, CaptureEdgeTriggerSetup):
+            _apply_edge_trigger_setup(trigger)
+        else:
+            _apply_pulse_trigger_setup(trigger)
         actual = _query_capture_session_snapshot()
         differences = _capture_session_differences(
             channels, timebase, acquisition, trigger, actual
@@ -4067,12 +4263,15 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
         }
         scope._write_checked(f":TRIG:PULS:WHEN {when_map[when]}")
 
-        # Set upper width
-        scope._write_checked(f":TRIG:PULS:UWID {upper_width}")
-
-        # Set lower width if WITHIN
-        if when == "WITHIN" and lower_width is not None:
-            scope._write_checked(f":TRIG:PULS:LWID {lower_width}")
+        # Apply the active width register for the selected condition. The legacy
+        # upper_width parameter is the single threshold for GREATER and LESS.
+        effective_lower = upper_width if when == "GREATER" else lower_width
+        for command, width in _pulse_width_write_commands(
+            when,
+            effective_lower,
+            upper_width if when != "GREATER" else None,
+        ):
+            scope._write_checked(f"{command} {width}")
 
         # Map polarity to SCPI format
         polarity_map = {
@@ -4087,7 +4286,11 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
         # Verify configuration by reading back
         actual_source = scope._query_checked(":TRIG:PULS:SOUR?").strip()
         actual_when = scope._query_checked(":TRIG:PULS:WHEN?").strip()
-        actual_upper = float(scope._query_checked(":TRIG:PULS:UWID?"))
+        actual_upper = float(
+            scope._query_checked(
+                ":TRIG:PULS:LWID?" if when == "GREATER" else ":TRIG:PULS:UWID?"
+            )
+        )
         actual_polarity = scope._query_checked(":TRIG:PULS:POL?").strip()
         actual_level = float(scope._query_checked(":TRIG:PULS:LEV?"))
 

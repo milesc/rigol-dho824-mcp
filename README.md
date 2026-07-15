@@ -168,8 +168,9 @@ capture directory, both file paths, enabled-channel order, point count, byte cou
 and verification status.
 
 For repeatable setup, `get_capture_session_config` reads the complete normalized capture
-configuration. `configure_capture_session` stops acquisition, applies an explicit four-channel
-setup plus timebase, acquisition, and edge-trigger settings in dependency-safe order, then
+configuration, including active edge- or pulse-trigger details. `configure_capture_session`
+stops acquisition, applies an explicit four-channel
+setup plus timebase, acquisition, and edge- or pulse-trigger settings in dependency-safe order, then
 returns the normalized request, complete readback, and any differences.
 
 For externally stimulated transient tests, `arm_single_and_capture_wfm` arms one acquisition,
