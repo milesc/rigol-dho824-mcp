@@ -172,6 +172,9 @@ configuration, including active edge- or pulse-trigger details. `configure_captu
 stops acquisition, applies an explicit four-channel
 setup plus timebase, acquisition, and edge- or pulse-trigger settings in dependency-safe order, then
 returns the normalized request, complete readback, and any differences.
+The complete timebase setup includes `auto_roll_enabled` (default `false`). Keep it disabled for
+triggered MAIN sweeps at 50 ms/div or slower; the server applies that choice before scale and offset
+so the instrument cannot silently enter ROLL mode or reset the requested horizontal position.
 
 For externally stimulated transient tests, `arm_single_and_capture_wfm` arms one acquisition,
 waits for the configured trigger, and automatically creates the same verified native bundle

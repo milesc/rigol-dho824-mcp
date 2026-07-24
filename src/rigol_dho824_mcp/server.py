@@ -128,17 +128,29 @@ def _validate_native_wfm(wfm_path: str, metadata: dict) -> None:
         raise RuntimeError("The WFM contains no enabled analog channels")
 
     points = int(metadata["memory_depth_per_channel"])
-    payload_bytes = points * len(enabled) * 2
     wfm_bytes = os.path.getsize(wfm_path)
-    data_offset = wfm_bytes - payload_bytes
-    if data_offset < 40:
-        raise RuntimeError("WFM is too small for the expected sample payload")
+    geometry_candidates = []
+    for storage_slots in range(len(enabled), 5):
+        data_offset = wfm_bytes - points * storage_slots * 2
+        if data_offset < 40:
+            continue
+        with open(wfm_path, "rb") as stream:
+            stream.seek(data_offset - 40)
+            header_count = struct.unpack("<Q", stream.read(8))[0]
+        if header_count == points * storage_slots:
+            geometry_candidates.append((storage_slots, data_offset))
+    if len(geometry_candidates) != 1:
+        raise RuntimeError(
+            "WFM payload geometry is ambiguous or invalid for "
+            f"{len(enabled)} enabled channels: {geometry_candidates}"
+        )
+    storage_slots, data_offset = geometry_candidates[0]
 
     with open(wfm_path, "rb") as stream, mmap.mmap(
         stream.fileno(), 0, access=mmap.ACCESS_READ
     ) as image:
         header_count = struct.unpack_from("<Q", image, data_offset - 40)[0]
-        expected_count = points * len(enabled)
+        expected_count = points * storage_slots
         if header_count != expected_count:
             raise RuntimeError(
                 f"WFM header count {header_count} != expected {expected_count}"
@@ -149,8 +161,7 @@ def _validate_native_wfm(wfm_path: str, metadata: dict) -> None:
             actual = [
                 struct.unpack_from(
                     "<H",
-                    image,
-                    data_offset + 2 * (index * len(enabled) + slot),
+                    image, data_offset + 2 * (index * storage_slots + slot),
                 )[0]
                 for index in range(len(expected))
             ]
@@ -172,6 +183,8 @@ def _validate_native_wfm(wfm_path: str, metadata: dict) -> None:
         wfm_sha256=_sha256_file(wfm_path),
         sample_data_offset=data_offset,
         sample_interleave=[entry["channel"] for entry in enabled],
+        sample_storage_interleave=[entry["channel"] for entry in enabled]
+        + [None] * (storage_slots - len(enabled)),
     )
 
 
@@ -303,6 +316,15 @@ ChannelLabelField = Annotated[str, Field(description="Custom label string (max 4
 MainTimeScaleField = Annotated[float, Field(ge=5e-9, le=500, description="Time per division in seconds (5 ns/div to 500 s/div)")]
 DelayedTimeScaleField = Annotated[float, Field(ge=5e-9, le=500, description="Zoom window time per division in seconds (must be ≤ main scale)")]
 DelayedTimeOffsetField = Annotated[float, Field(description="Zoom window offset in seconds")]
+AutoRollEnabledField = Annotated[
+    bool,
+    Field(
+        description=(
+            "Whether slow-timebase Auto ROLL is enabled. Disable it for triggered "
+            "MAIN sweeps at 50 ms/div or slower."
+        )
+    ),
+]
 
 # Hardware counter fields
 CounterDigitsField = Annotated[int, Field(description="Resolution (5 or 6 digits)", ge=5, le=6)]
@@ -748,6 +770,7 @@ class CaptureTimebaseSetup(BaseModel):
     """Complete deterministic main and optional delayed timebase setup."""
 
     mode: TimebaseModeField = TimebaseMode.MAIN
+    auto_roll_enabled: AutoRollEnabledField = False
     time_per_div: MainTimeScaleField
     time_offset: TimeOffsetField
     delayed_enabled: Annotated[
@@ -892,6 +915,7 @@ class TimebaseConfigResult(TypedDict):
     """Complete timebase configuration."""
 
     mode: TimebaseModeField
+    auto_roll_enabled: AutoRollEnabledField
     time_per_div: MainTimeScaleField
     time_offset: TimeOffsetField
     delayed_enabled: Annotated[bool, Field(description="Whether delayed/zoom timebase is enabled")]
@@ -3281,6 +3305,7 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
 
         result: TimebaseConfigResult = {
             "mode": mode,
+            "auto_roll_enabled": scope._query_bool_checked(":TIM:ROLL?"),
             "time_per_div": time_per_div,
             "time_offset": time_offset,
             "delayed_enabled": delayed_enabled,
@@ -3377,6 +3402,7 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
     def _apply_timebase_settings(
         *,
         mode: Optional[TimebaseMode] = None,
+        auto_roll_enabled: Optional[bool] = None,
         time_per_div: Optional[float] = None,
         time_offset: Optional[float] = None,
         delayed_enabled: Optional[bool] = None,
@@ -3384,6 +3410,11 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
         delayed_time_offset: Optional[float] = None,
     ) -> None:
         """Apply timebase settings in dependency-safe order."""
+        # Auto ROLL can force the display into ROLL at 50 ms/div and slower, where
+        # physical SINGLE is disabled. Changing it also resets the main offset on the
+        # DHO824, so it must precede mode, scale, and especially the requested offset.
+        if auto_roll_enabled is not None:
+            scope._write_checked(f":TIM:ROLL {1 if auto_roll_enabled else 0}")
         if mode is not None:
             scope._write_checked(f":TIM:MODE {mode.value}")
         if time_per_div is not None:
@@ -3538,6 +3569,7 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
         observed_timebase = actual["timebase"]
         for field_name in (
             "mode",
+            "auto_roll_enabled",
             "time_per_div",
             "time_offset",
             "delayed_enabled",
@@ -3720,6 +3752,7 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
             )
         _apply_timebase_settings(
             mode=timebase.mode,
+            auto_roll_enabled=timebase.auto_roll_enabled,
             time_per_div=timebase.time_per_div,
             time_offset=timebase.time_offset,
             delayed_enabled=timebase.delayed_enabled,
@@ -3765,6 +3798,7 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
     @with_scope_connection
     async def set_timebase_config(
         mode: Optional[TimebaseModeField] = None,
+        auto_roll_enabled: Optional[AutoRollEnabledField] = None,
         time_per_div: Optional[MainTimeScaleField] = None,
         time_offset: Optional[TimeOffsetField] = None,
         delayed_enabled: Optional[Annotated[bool, Field(description="Enable delayed/zoom timebase")]] = None,
@@ -3778,6 +3812,7 @@ def create_server(temp_dir: str, client_temp_dir: Optional[str] = None) -> FastM
         """
         _apply_timebase_settings(
             mode=mode,
+            auto_roll_enabled=auto_roll_enabled,
             time_per_div=time_per_div,
             time_offset=time_offset,
             delayed_enabled=delayed_enabled,
